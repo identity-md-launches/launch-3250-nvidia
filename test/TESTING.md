@@ -65,26 +65,40 @@ assuming every individual random sequence contains every action.
 
 Ordinary transfers use the accepted implementation's documented interpretation:
 0.5% of the gross amount goes to Jensen and 1% of the gross amount is removed from
-supply. The supplied launch checks require exact factory, distributor and pool
-flows, so those endpoints are tested as exempt. This includes pool trades: these
-tests do not claim that trades through that pool collect the ordinary transfer tax.
-The burn is a supply reduction, not a balance assigned to the zero address.
+supply. The burn is a supply reduction, not a balance assigned to the zero address.
 
-The supplied protected tests also exercise a complete Uniswap v4 launch in the
-verification harness. This repository's new tests check the token boundary; they
-do not claim to reproduce those external factory and pool contracts locally.
+Launch flows follow the revised implementation: the factory and the published
+distributor are exempt in both directions; the Uniswap v4 PoolManager is exempt only
+as a receiver (seeds and sells arrive whole). Transfers out of it (buys, withdrawals,
+`take`) are taxed, and the whole gross amount leaves its balance. The stateful model
+encodes exactly that rule (`to == pool` is exempt, `from == pool` is not) and counts
+that taxed pool payouts actually happen. Where the token consults the factory (any
+transfer whose receiver is not the pool and where neither side is the factory,
+including transfers out of the pool) the model expects the distributor to be cached.
 
-Two confirmed limitations are reported in `.imd-findings.json`, each with its
-complete self-contained Foundry proof source and the observed failure:
+`test/NvidiaToken.pool.t.sol` covers the pool rule directly with an independent spec
+oracle (`Math.mulDiv(amount, 50, 10_000)` and `Math.mulDiv(amount, 100, 10_000)`):
+outbound payouts directly and via `transferFrom` (gross allowance spent), a sell and
+buy-back round trip that loses exactly the tax, pool to factory and pool to
+distributor (taxed until the factory names it, exact after), pool self-transfers,
+overspend and short-allowance reverts with full rollback, and the emitted legs.
 
-- An exactly 32-byte factory result with nonzero address padding reverts during
-  decoding instead of being treated as unknown. This requires a faulty trusted
-  dependency before discovery is cached.
-- `splitTransfer(type(uint256).max)` panics on intermediate multiplication. This
-  affects large preview inputs, not transferable amounts within the fixed supply.
+It also covers a griefing angle: a first distributor claim submitted with a chosen
+gas limit, so the capped factory lookup might fail and the claim be taxed. A fuzz
+test checks the claim is either exact or reverts; an exhaustive scratch sweep over
+gas limits 5,000 to 120,000 in steps of 7 found 8,605 exact claims, 7,824 reverts and
+no short claim.
 
-Both proofs were executed and failed for the reported reasons. They are embedded
-in the findings rather than submitted as passing tests that endorse the defects.
-The wrong-length response fuzz test covers lengths other than 32 explicitly; the
-reported proof covers the missing malformed 32-byte case. Actual transfer fuzzing
-uses feasible balances, while the maximum preview limitation remains reported.
+The two limitations reported in the previous round are fixed by the revision and are
+now regression tests rather than findings:
+
+- a 32-byte factory answer that is not an address is treated as unknown, not cached,
+  does not block transfers, and a later valid answer is still honoured (fuzzed over
+  every word above `type(uint160).max`);
+- `splitTransfer` matches the spec over the whole `uint256` range, including
+  `type(uint256).max`.
+
+The supplied protected tests exercise a complete Uniswap v4 launch in the
+verification harness. These tests check the token boundary with a minimal escrow
+PoolManager; they do not reproduce the external factory and pool contracts locally.
+No open findings remain for the revised implementation.

@@ -95,8 +95,14 @@ contract NvidiaTokenStatefulTest is NvidiaTokenFixture {
         handler.setFactoryAvailable(false);
         handler.transfer(2, 4, 0, 5); // cached claims remain live
         _checkAll();
-        handler.transfer(1, 4, 0, 6); // exhaust an exempt holder
+        handler.transfer(4, 1, 0, 5); // a sell into the pool arrives whole
         _checkAll();
+        handler.transfer(1, 4, 0, 6); // the pool's whole balance leaves it, taxed
+        _checkAll();
+        assertEq(token.balanceOf(pool), 0, "the pool's balance drops by the gross amount");
+        handler.transfer(0, 4, 0, 6); // exhaust an exempt holder
+        _checkAll();
+        assertGt(handler.positivePoolOutboundTaxedCalls(), 0);
         assertGt(handler.positiveTaxedCalls(), 0);
         assertGt(handler.positiveExemptCalls(), 0);
         assertGt(handler.positiveDelegatedCalls(), 0);

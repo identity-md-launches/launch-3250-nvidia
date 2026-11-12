@@ -26,6 +26,7 @@ contract NvidiaTokenStateHandler is Test {
     uint256 public positiveExemptCalls;
     uint256 public positiveDelegatedCalls;
     uint256 public rejectedCalls;
+    uint256 public positivePoolOutboundTaxedCalls;
 
     constructor(NvidiaToken token_, MockLaunchFactory factory_, address[8] memory actors_) {
         token = token_;
@@ -123,8 +124,10 @@ contract NvidiaTokenStateHandler is Test {
         factoryAvailable = available;
     }
 
+    /// @dev Exempt in both directions: the factory, and the distributor once it is known. The pool
+    /// (index 1) is not: only transfers INTO it are untaxed, transfers out of it pay the tax.
     function expectedExempt(uint256 index) public view returns (bool) {
-        return index < 2 || (index == 2 && (cached || (published && factoryAvailable)));
+        return index == 0 || (index == 2 && (cached || (published && factoryAvailable)));
     }
 
     function _approve(uint256 owner, uint256 operator, uint256 amount) private {
@@ -134,7 +137,8 @@ contract NvidiaTokenStateHandler is Test {
     }
 
     function _move(uint256 from, uint256 to, uint256 operator, uint256 amount, bool delegated) private {
-        bool exempt = expectedExempt(from) || expectedExempt(to);
+        // A sell or seed into the pool arrives whole; a buy or withdrawal out of it is taxed.
+        bool exempt = expectedExempt(from) || expectedExempt(to) || to == 1;
         uint256 supplyBefore = token.totalSupply();
         if (delegated) {
             vm.prank(actors[operator]);
@@ -159,7 +163,10 @@ contract NvidiaTokenStateHandler is Test {
         if (amount != 0) {
             if (exempt) positiveExemptCalls++;
             else positiveTaxedCalls++;
-            if (from >= 2 && to >= 2 && published && factoryAvailable) cached = true;
+            // The token consults the factory only when neither side is the factory and the receiver
+            // is not the pool; transfers out of the pool do consult it.
+            if (from != 0 && to >= 2 && published && factoryAvailable) cached = true;
+            if (from == 1 && !exempt) positivePoolOutboundTaxedCalls++;
         }
         assertLe(token.totalSupply(), supplyBefore, "a transfer increased supply");
     }

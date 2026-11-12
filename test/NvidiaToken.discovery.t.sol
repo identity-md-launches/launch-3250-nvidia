@@ -172,6 +172,8 @@ contract NvidiaTokenDiscoveryTest is NvidiaTokenFixture {
         amount = bound(amount, 1, SUPPLY);
         factory.setDistributor(LAUNCH, distributor);
         address exempt = role % 3 == 0 ? address(factory) : role % 3 == 1 ? pool : distributor;
+        // The pool is exempt only as a receiver; its outbound leg is taxed (see the pool tests).
+        if (exempt == pool) inbound = true;
         address from = inbound ? alice : exempt;
         address to = inbound ? exempt : alice;
         if (from != address(factory)) _fund(from, amount);
