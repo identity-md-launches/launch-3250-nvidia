@@ -68,8 +68,7 @@ contract TransferHandler is Test {
 
     function _tally(address from, address to, uint256 amount) private {
         address recipient = token.TRIBUTE_RECIPIENT();
-        bool exempt = from == factory || to == factory || from == poolManager || to == poolManager
-            || from == distributor || to == distributor;
+        bool exempt = from == factory || to == factory || to == poolManager || from == distributor || to == distributor;
         if (exempt || amount == 0) {
             exemptTransfers++;
             if (from == recipient) ghostRecipientBalance -= amount;

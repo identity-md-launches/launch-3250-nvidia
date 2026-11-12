@@ -14,11 +14,13 @@ interface ILaunchFactory {
 /// The whole supply, 1,000,000,000 ADVN, is minted once to the deployer (the launch factory) in the
 /// constructor. Nothing can mint afterwards, and there is no owner, pause, blacklist or upgrade path.
 /// @dev Launch flows are exempt from the tax so they move exactly what they say: transfers from or to
-/// the factory, from or to the Uniswap v4 PoolManager, and from or to the launch's MerkleDistributor
-/// (looked up on the factory at transfer time, then cached). The PoolManager settles a swap by checking
-/// its own balance change, so a tax on either side of a pool swap would make every sell revert; this is
-/// why pool swaps through the PoolManager are untaxed while wallet-to-wallet transfers, transfers to
-/// other venues and exchange deposits are taxed.
+/// the factory, transfers INTO the Uniswap v4 PoolManager, and transfers from or to the launch's
+/// MerkleDistributor (looked up on the factory at transfer time, then cached). The PoolManager settles
+/// a seed or a sell by checking its own balance change, so tokens entering it must arrive whole.
+/// Tokens leaving the PoolManager (pool buys, liquidity withdrawals, `take`) are taxed like any other
+/// transfer: the whole tax comes out of the PoolManager's balance and the receiver gets 98.5%. Taxing
+/// the outbound leg is what stops anyone from routing a wallet-to-wallet payment through the
+/// PoolManager's `sync`/`settle`/`take` escrow to skip the tax.
 contract NvidiaToken is ERC20 {
     // ------------------------------------------------------------------------
     // Constants
@@ -39,6 +41,10 @@ contract NvidiaToken is ERC20 {
     /// @notice Jensen Huang's wallet, as given by the requester. Fixed for the life of the token.
     address public constant TRIBUTE_RECIPIENT = 0xc59b0c072f73ceEA3Dc354031165501c0Ff25023;
 
+    /// @notice Gas forwarded to the factory's `distributorOf` lookup. A mapping getter needs a few
+    /// thousand; the cap bounds what a misbehaving factory can cost a transfer.
+    uint256 public constant LOOKUP_GAS = 50_000;
+
     // ------------------------------------------------------------------------
     // Launch addresses (exempt from the tax)
     // ------------------------------------------------------------------------
@@ -46,7 +52,8 @@ contract NvidiaToken is ERC20 {
     /// @notice The launch factory: receives the whole supply at deploy and pays it out untaxed.
     address public immutable factory;
 
-    /// @notice The Uniswap v4 PoolManager: seeds and swaps settle exactly.
+    /// @notice The Uniswap v4 PoolManager: tokens sent to it (the seed, sells) arrive exactly; tokens it
+    /// sends out are taxed.
     address public immutable poolManager;
 
     /// @notice This launch's number on the factory, used to look up its MerkleDistributor.
@@ -91,15 +98,18 @@ contract NvidiaToken is ERC20 {
     /// @notice How a taxed transfer of `amount` splits: what the receiver gets, what the tribute recipient
     /// gets and what is burned. Rounding favours the receiver: each cut is rounded down.
     function splitTransfer(uint256 amount) public pure returns (uint256 net, uint256 tribute, uint256 burned) {
-        tribute = (amount * TRIBUTE_BPS) / BPS_DENOMINATOR;
-        burned = (amount * BURN_BPS) / BPS_DENOMINATOR;
+        // Divide by the reduced denominators (10_000 / 50 = 200, 10_000 / 100 = 100): the same floor as
+        // amount * BPS / 10_000, without the multiplication that overflows for very large amounts.
+        tribute = amount / (BPS_DENOMINATOR / TRIBUTE_BPS);
+        burned = amount / (BPS_DENOMINATOR / BURN_BPS);
         net = amount - tribute - burned;
     }
 
-    /// @notice Whether transfers from or to `account` move untaxed. True for the factory, the PoolManager
-    /// and the launch's distributor (once the factory knows it).
+    /// @notice Whether transfers both from and to `account` move untaxed. True for the factory and the
+    /// launch's distributor (once the factory knows it). The PoolManager is not fully exempt: transfers
+    /// to it are untaxed, transfers from it are taxed.
     function isExempt(address account) public view returns (bool) {
-        if (account == factory || account == poolManager) return true;
+        if (account == factory) return true;
         address d = distributor;
         if (d == address(0)) d = _lookupDistributor();
         return d != address(0) && account == d;
@@ -127,10 +137,11 @@ contract NvidiaToken is ERC20 {
         emit TransferTaxed(from, to, net, tribute, burned);
     }
 
-    /// @dev A transfer is a launch flow when either side is the factory, the PoolManager or the distributor.
+    /// @dev A transfer is a launch flow when either side is the factory or the distributor, or when the
+    /// receiver is the PoolManager. Transfers out of the PoolManager are deliberately not launch flows.
     /// The distributor is read from the factory the first time it is needed and cached once it is known.
     function _isLaunchFlow(address from, address to) private returns (bool) {
-        if (from == factory || to == factory || from == poolManager || to == poolManager) return true;
+        if (from == factory || to == factory || to == poolManager) return true;
         address d = distributor;
         if (d == address(0)) {
             d = _lookupDistributor();
@@ -142,11 +153,18 @@ contract NvidiaToken is ERC20 {
         return d != address(0) && (from == d || to == d);
     }
 
-    /// @dev Reads `distributorOf(launchNumber)` from the factory. Any failure (no code, a revert, a short
-    /// answer) reads as "not known yet" so ordinary transfers never depend on the factory being reachable.
+    /// @dev Reads `distributorOf(launchNumber)` from the factory with a capped gas stipend. Any failure (no
+    /// code, a revert, running out of the stipend, an answer that is not exactly one word, a word that is
+    /// not an address) reads as "not known yet", so ordinary transfers never depend on the factory.
     function _lookupDistributor() private view returns (address) {
-        (bool ok, bytes memory data) = factory.staticcall(abi.encodeCall(ILaunchFactory.distributorOf, (launchNumber)));
+        // The returned buffer is copied, but the callee can only build one as large as LOOKUP_GAS pays for.
+        (bool ok, bytes memory data) =
+            factory.staticcall{gas: LOOKUP_GAS}(abi.encodeCall(ILaunchFactory.distributorOf, (launchNumber)));
         if (!ok || data.length != 32) return address(0);
-        return abi.decode(data, (address));
+        uint256 word = abi.decode(data, (uint256));
+        if (word > type(uint160).max) return address(0);
+        // casting to 'uint160' is safe because the word was checked against type(uint160).max above
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return address(uint160(word));
     }
 }

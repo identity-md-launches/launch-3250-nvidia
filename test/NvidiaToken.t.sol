@@ -6,7 +6,16 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {NvidiaToken} from "../src/NvidiaToken.sol";
 import {DeployNvidiaToken} from "../script/DeployNvidiaToken.s.sol";
-import {MockLaunchFactory, RevertingFactory, MalformedFactory} from "./mocks/MockLaunchFactory.sol";
+import {
+    MockLaunchFactory,
+    RevertingFactory,
+    MalformedFactory,
+    DirtyWordFactory,
+    GasBurningFactory,
+    HugeAnswerFactory,
+    MiniPoolManager,
+    EscrowRoute
+} from "./mocks/MockLaunchFactory.sol";
 
 contract NvidiaTokenTest is Test {
     uint256 constant SUPPLY = 1_000_000_000e18;
@@ -124,18 +133,36 @@ contract NvidiaTokenTest is Test {
         assertEq(token.totalSupply(), SUPPLY);
     }
 
-    function test_poolManagerBothWaysIsUntaxed() public {
+    function test_poolManagerInboundIsUntaxedOutboundIsTaxed() public {
         _fund(alice, 1_000e18);
         // Sell: alice -> pool manager, exact.
         vm.prank(alice);
         token.transfer(poolManager, 1_000e18);
         assertEq(token.balanceOf(poolManager), 1_000e18);
-        // Buy: pool manager -> bob, exact.
-        vm.prank(poolManager);
-        token.transfer(bob, 1_000e18);
-        assertEq(token.balanceOf(bob), 1_000e18);
         assertEq(token.balanceOf(JENSEN), 0);
         assertEq(token.totalSupply(), SUPPLY);
+        // Buy: pool manager -> bob, taxed; the whole tax comes out of the pool manager's balance.
+        (uint256 net, uint256 tribute, uint256 burned) = _split(1_000e18);
+        vm.prank(poolManager);
+        token.transfer(bob, 1_000e18);
+        assertEq(token.balanceOf(poolManager), 0);
+        assertEq(token.balanceOf(bob), net);
+        assertEq(token.balanceOf(JENSEN), tribute);
+        assertEq(token.totalSupply(), SUPPLY - burned);
+    }
+
+    function test_routingThroughPoolManagerEscrowIsTaxed() public {
+        MiniPoolManager pm = new MiniPoolManager();
+        NvidiaToken t = new NvidiaToken(address(this), address(pm), LAUNCH_NUMBER);
+        EscrowRoute route = new EscrowRoute(pm, address(t));
+        t.transfer(address(route), 1_000_000e18);
+
+        route.send(bob, 1_000_000e18);
+        (uint256 net, uint256 tribute, uint256 burned) = _split(1_000_000e18);
+        assertEq(t.balanceOf(bob), net, "pass-through skipped the tax");
+        assertEq(t.balanceOf(JENSEN), tribute);
+        assertEq(t.totalSupply(), SUPPLY - burned);
+        assertEq(t.balanceOf(address(pm)), 0);
     }
 
     function test_distributorFlowsAreUntaxedAndCached() public {
@@ -164,7 +191,7 @@ contract NvidiaTokenTest is Test {
 
     function test_isExemptReflectsLaunchAddresses() public {
         assertTrue(token.isExempt(address(factory)));
-        assertTrue(token.isExempt(poolManager));
+        assertFalse(token.isExempt(poolManager), "only transfers into the pool manager are untaxed");
         assertFalse(token.isExempt(distributor), "unknown until the factory names it");
         assertFalse(token.isExempt(alice));
         assertFalse(token.isExempt(JENSEN));
@@ -420,6 +447,43 @@ contract NvidiaTokenTest is Test {
         assertEq(fresh.distributor(), address(0));
     }
 
+    function _assertFactoryTolerated(address bad) internal {
+        vm.prank(bad);
+        NvidiaToken fresh = new NvidiaToken(bad, poolManager, LAUNCH_NUMBER);
+        vm.prank(bad);
+        fresh.transfer(alice, 1_000e18);
+        assertFalse(fresh.isExempt(bob));
+        uint256 gasBefore = gasleft();
+        vm.prank(alice);
+        assertTrue(fresh.transfer(bob, 100e18));
+        assertLt(gasBefore - gasleft(), 300_000, "a bad factory made the transfer expensive");
+        (uint256 net, uint256 tribute, uint256 burned) = _split(100e18);
+        assertEq(fresh.balanceOf(bob), net);
+        assertEq(fresh.balanceOf(JENSEN), tribute);
+        assertEq(fresh.totalSupply(), SUPPLY - burned);
+        assertEq(fresh.distributor(), address(0));
+    }
+
+    function test_dirtyWordFactoryAnswerDoesNotBlockTransfers() public {
+        _assertFactoryTolerated(address(new DirtyWordFactory()));
+    }
+
+    function test_gasBurningFactoryDoesNotBlockTransfers() public {
+        _assertFactoryTolerated(address(new GasBurningFactory()));
+    }
+
+    function test_hugeFactoryAnswerDoesNotBlockTransfers() public {
+        _assertFactoryTolerated(address(new HugeAnswerFactory()));
+    }
+
+    function test_splitTransferHandlesMaxAmount() public view {
+        uint256 amount = type(uint256).max;
+        (uint256 net, uint256 tribute, uint256 burned) = token.splitTransfer(amount);
+        assertEq(tribute, amount / 200);
+        assertEq(burned, amount / 100);
+        assertEq(net, amount - tribute - burned);
+    }
+
     // ------------------------------------------------------------------------
     // Fuzz
     // ------------------------------------------------------------------------
@@ -456,7 +520,7 @@ contract NvidiaTokenTest is Test {
     function testFuzz_launchFlowsAreExact(uint256 amount, uint8 which) public {
         amount = bound(amount, 0, SUPPLY);
         factory.setDistributor(LAUNCH_NUMBER, distributor);
-        address exempt = which % 3 == 0 ? address(factory) : which % 3 == 1 ? poolManager : distributor;
+        address exempt = which % 2 == 0 ? address(factory) : distributor;
         if (exempt != address(factory)) _fund(exempt, amount);
 
         vm.prank(exempt);
